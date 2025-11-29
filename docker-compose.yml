@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  topic-limiter-bot:
+    build: .
+    container_name: topic-limiter-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist message records outside the container
+      - ./data:/app/data
+    environment:
+      - TZ=UTC
+      - DATA_DIR=/app/data
