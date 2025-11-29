@@ -5,7 +5,7 @@ on:
     branches: ["main"]
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_NAME: ghcr.io/pouyaevan/topic-limiter
 
 jobs:
   build-and-push:
