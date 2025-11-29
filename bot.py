@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
@@ -8,9 +9,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configuration
+# Setup logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=getattr(logging, LOG_LEVEL, logging.INFO)
+)
+logger = logging.getLogger(__name__)
+
+# Configuration from environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TOPIC_ID = 1362  # From the link https://t.me/PasarGuardGP/1362
+TOPIC_ID = int(os.getenv("TOPIC_ID", "0"))
+MESSAGE_COOLDOWN_HOURS = int(os.getenv("MESSAGE_COOLDOWN_HOURS", "24"))
+WARNING_DELETE_SECONDS = int(os.getenv("WARNING_DELETE_SECONDS", "10"))
+ADMIN_CACHE_TTL = int(os.getenv("ADMIN_CACHE_TTL", "300"))  # 5 minutes default
 
 # Data file to persist message records (use /app/data in Docker)
 DATA_DIR = os.getenv("DATA_DIR", ".")
@@ -29,12 +41,12 @@ def save_records(records):
         json.dump(records, f, indent=2)
 
 def clean_old_records(records):
-    """Remove records older than 24 hours."""
+    """Remove records older than the cooldown period."""
     now = datetime.now()
     cleaned = {}
     for user_id, timestamp_str in records.items():
         timestamp = datetime.fromisoformat(timestamp_str)
-        if now - timestamp < timedelta(hours=24):
+        if now - timestamp < timedelta(hours=MESSAGE_COOLDOWN_HOURS):
             cleaned[user_id] = timestamp_str
     return cleaned
 
@@ -47,10 +59,10 @@ def can_user_send_message(user_id: int, records: dict) -> tuple[bool, timedelta 
     last_message_time = datetime.fromisoformat(records[user_id_str])
     time_since_last = datetime.now() - last_message_time
     
-    if time_since_last >= timedelta(hours=24):
+    if time_since_last >= timedelta(hours=MESSAGE_COOLDOWN_HOURS):
         return True, None
     
-    time_remaining = timedelta(hours=24) - time_since_last
+    time_remaining = timedelta(hours=MESSAGE_COOLDOWN_HOURS) - time_since_last
     return False, time_remaining
 
 def check_duplicate_users_today(records: dict) -> list[str]:
@@ -71,7 +83,6 @@ def check_duplicate_users_today(records: dict) -> list[str]:
 
 # Cache for admin list (to avoid too many API calls)
 admin_cache = {}
-ADMIN_CACHE_TTL = 300  # 5 minutes
 
 async def is_admin(bot, chat_id: int, user_id: int) -> bool:
     """Check if user is an admin in the group. Uses caching to reduce API calls."""
@@ -97,7 +108,7 @@ async def is_admin(bot, chat_id: int, user_id: int) -> bool:
         
         return user_id in admin_ids
     except Exception as e:
-        print(f"Error fetching admins: {e}")
+        logger.error(f"Error fetching admins: {e}")
         return False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -111,8 +122,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = message.chat_id
     message_thread_id = message.message_thread_id
     
-    # Debug logging (can be removed in production)
-    print(f"Message from chat: {chat_id}, thread: {message_thread_id}, user: {message.from_user.id}")
+    # Debug logging
+    logger.debug(f"Message from chat: {chat_id}, thread: {message_thread_id}, user: {message.from_user.id}")
     
     # Only process messages in the specific topic
     if message_thread_id != TOPIC_ID:
@@ -147,16 +158,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warning = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=TOPIC_ID,
-                text=f"⚠️ @{username}, you can only send 1 message per 24 hours.\n"
+                text=f"⚠️ @{username}, you can only send 1 message per {MESSAGE_COOLDOWN_HOURS} hours.\n"
                      f"Please wait {hours}h {minutes}m before sending another message.",
             )
             
-            # Delete warning after 10 seconds
-            await asyncio.sleep(10)
+            # Delete warning after configured seconds
+            await asyncio.sleep(WARNING_DELETE_SECONDS)
             await warning.delete()
             
         except Exception as e:
-            print(f"Error handling message: {e}")
+            logger.error(f"Error handling message: {e}")
         
         return
     
@@ -164,7 +175,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     records[str(user_id)] = datetime.now().isoformat()
     save_records(records)
     
-    print(f"✅ Message from {username} (ID: {user_id}) recorded")
+    logger.info(f"Message from {username} (ID: {user_id}) recorded")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot status and current records."""
@@ -253,10 +264,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ This command is for group admins only.")
         return
     
-    help_text = """
+    help_text = f"""
 🤖 **Topic Message Limiter Bot**
 
-This bot limits users to 1 message per 24 hours in the monitored topic.
+This bot limits users to 1 message per {MESSAGE_COOLDOWN_HOURS} hours in the monitored topic.
 
 **Commands (Admin Only):**
 • `/status` - View current message records
@@ -265,21 +276,34 @@ This bot limits users to 1 message per 24 hours in the monitored topic.
 • `/help` - Show this message
 
 **How it works:**
-1. Users can send only 1 message per 24 hours in the topic
+1. Users can send only 1 message per {MESSAGE_COOLDOWN_HOURS} hours in the topic
 2. Additional messages are automatically deleted
 3. A temporary warning is shown to the user
+
+**Current Config:**
+• Topic ID: `{TOPIC_ID}`
+• Cooldown: `{MESSAGE_COOLDOWN_HOURS}` hours
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 def main():
     """Start the bot."""
+    # Validate required configuration
     if not BOT_TOKEN:
-        print("❌ Error: BOT_TOKEN not found in environment variables!")
-        print("Please create a .env file with BOT_TOKEN=your_token_here")
+        logger.error("BOT_TOKEN not found in environment variables!")
+        logger.error("Please create a .env file with BOT_TOKEN=your_token_here")
         return
     
-    print("🚀 Starting Topic Message Limiter Bot...")
-    print(f"📍 Monitoring Topic ID: {TOPIC_ID}")
+    if not TOPIC_ID:
+        logger.error("TOPIC_ID not found in environment variables!")
+        logger.error("Please set TOPIC_ID in your .env file")
+        return
+    
+    logger.info("Starting Topic Message Limiter Bot...")
+    logger.info(f"Monitoring Topic ID: {TOPIC_ID}")
+    logger.info(f"Message cooldown: {MESSAGE_COOLDOWN_HOURS} hours")
+    logger.info(f"Warning delete delay: {WARNING_DELETE_SECONDS} seconds")
+    logger.info(f"Admin cache TTL: {ADMIN_CACHE_TTL} seconds")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
@@ -292,7 +316,7 @@ def main():
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     
     # Start the bot
-    print("✅ Bot is running! Press Ctrl+C to stop.")
+    logger.info("Bot is running! Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

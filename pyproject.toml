@@ -1,0 +1,14 @@
+[project]
+name = "topic-limiter"
+version = "1.0.0"
+description = "Telegram bot that limits users to 1 message per day in a specific topic"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot>=20.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

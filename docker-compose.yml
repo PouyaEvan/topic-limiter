@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   topic-limiter-bot:
-    build: .
+    image: ghcr.io/pouyaevan/topic-limiter:latest
+    # Or build locally:
+    # build: .
     container_name: topic-limiter-bot
     restart: unless-stopped
     env_file:
@@ -13,3 +15,9 @@ services:
     environment:
       - TZ=UTC
       - DATA_DIR=/app/data
+      # Override any settings here if needed (or use .env file)
+      # - TOPIC_ID=1362
+      # - MESSAGE_COOLDOWN_HOURS=24
+      # - WARNING_DELETE_SECONDS=10
+      # - ADMIN_CACHE_TTL=300
+      # - LOG_LEVEL=INFO
