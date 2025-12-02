@@ -32,15 +32,39 @@ ALLOWED_GROUPS = [int(g.strip()) for g in ALLOWED_GROUPS_STR.split(",") if g.str
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "message_records.json")
 
+def ensure_data_file():
+    """Ensure the data file exists and is valid (not a directory)."""
+    # Create data directory if it doesn't exist
+    if DATA_DIR and DATA_DIR != "." and not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        logger.info(f"Created data directory: {DATA_DIR}")
+    
+    # Check if DATA_FILE is accidentally a directory (Docker mount issue)
+    if os.path.isdir(DATA_FILE):
+        logger.warning(f"{DATA_FILE} is a directory! This can happen if Docker mounted a non-existent file.")
+        logger.warning(f"Removing directory and creating file...")
+        import shutil
+        shutil.rmtree(DATA_FILE)
+    
+    # Create empty JSON file if it doesn't exist
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'w') as f:
+            json.dump({}, f)
+        logger.info(f"Created data file: {DATA_FILE}")
+
 def load_records():
     """Load message records from file."""
-    if os.path.exists(DATA_FILE):
+    ensure_data_file()
+    try:
         with open(DATA_FILE, 'r') as f:
             return json.load(f)
-    return {}
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"Error loading records: {e}. Starting with empty records.")
+        return {}
 
 def save_records(records):
     """Save message records to file."""
+    ensure_data_file()
     with open(DATA_FILE, 'w') as f:
         json.dump(records, f, indent=2)
 
@@ -87,6 +111,17 @@ def check_duplicate_users_today(records: dict) -> list[str]:
 
 # Cache for admin list (to avoid too many API calls)
 admin_cache = {}
+
+# Track users who recently received a warning (to avoid spam warnings)
+recent_warnings = {}
+
+async def delete_message_later(bot, chat_id: int, message_id: int, delay: int):
+    """Delete a message after a delay without blocking."""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.debug(f"Could not delete warning message: {e}")
 
 async def is_admin(bot, chat_id: int, user_id: int) -> bool:
     """Check if user is an admin in the group. Uses caching to reduce API calls."""
@@ -162,10 +197,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     can_send, time_remaining = can_user_send_message(user_id, records)
     
     if not can_send:
-        # Delete the message
+        # Delete the message immediately
         try:
             await message.delete()
-            
+            logger.debug(f"Deleted spam message from {username} (ID: {user_id})")
+        except Exception as e:
+            logger.error(f"Error deleting message: {e}")
+        
+        # Check if we recently warned this user (avoid warning spam)
+        user_warning_key = f"{chat_id}:{user_id}"
+        now = datetime.now()
+        
+        if user_warning_key in recent_warnings:
+            last_warning_time = recent_warnings[user_warning_key]
+            # Only send a new warning if the last one was more than WARNING_DELETE_SECONDS ago
+            if (now - last_warning_time).total_seconds() < WARNING_DELETE_SECONDS + 2:
+                # Skip sending another warning, just delete the message
+                return
+        
+        # Record that we're warning this user
+        recent_warnings[user_warning_key] = now
+        
+        try:
             # Calculate remaining time
             hours = int(time_remaining.total_seconds() // 3600)
             minutes = int((time_remaining.total_seconds() % 3600) // 60)
@@ -178,12 +231,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"Please wait {hours}h {minutes}m before sending another message.",
             )
             
-            # Delete warning after configured seconds
-            await asyncio.sleep(WARNING_DELETE_SECONDS)
-            await warning.delete()
+            # Schedule warning deletion without blocking (non-blocking)
+            asyncio.create_task(delete_message_later(context.bot, chat_id, warning.message_id, WARNING_DELETE_SECONDS))
             
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            logger.error(f"Error sending warning: {e}")
         
         return
     

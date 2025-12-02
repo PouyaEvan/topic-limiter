@@ -59,35 +59,36 @@ Build the image locally:
 docker build -t topic-limiter:latest .
 ```
 
-Run the container (recommended):
+Run the container (recommended - using a data directory):
 
 ```bash
+# Create data directory first
+mkdir -p ./data
+
 # Make sure you have a `.env` with `BOT_TOKEN` in the project root
 docker run -d \
    --name topic-limiter \
    --restart unless-stopped \
    --env-file .env \
-   -v "$(pwd)/message_records.json:/app/message_records.json" \
+   -e DATA_DIR=/app/data \
+   -v "$(pwd)/data:/app/data" \
    topic-limiter:latest
 ```
 
 Notes:
 - The `--env-file .env` flag reads environment variables (including `BOT_TOKEN`) from your local `.env` file.
-- The `-v` mount persists `message_records.json` on the host so message records survive container restarts. Adjust the right-hand path (`/app/message_records.json`) if your `Dockerfile` uses a different working directory.
-- If `message_records.json` does not exist, create it first and set ownership so the container process can write to it:
-
-```bash
-touch message_records.json
-chown $(id -u):$(id -g) message_records.json
-```
+- The `-v` mount persists the data directory on the host so message records survive container restarts.
+- **Important**: Always mount a **directory**, not a file. Docker will create a directory if the mount target doesn't exist, which causes errors.
 
 Alternative (pass token directly):
 
 ```bash
+mkdir -p ./data
 docker run -d --name topic-limiter \
    --restart unless-stopped \
    -e BOT_TOKEN=your_bot_token_here \
-   -v "$(pwd)/message_records.json:/app/message_records.json" \
+   -e DATA_DIR=/app/data \
+   -v "$(pwd)/data:/app/data" \
    topic-limiter:latest
 ```
 
