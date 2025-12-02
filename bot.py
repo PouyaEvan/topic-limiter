@@ -24,6 +24,10 @@ MESSAGE_COOLDOWN_HOURS = int(os.getenv("MESSAGE_COOLDOWN_HOURS", "24"))
 WARNING_DELETE_SECONDS = int(os.getenv("WARNING_DELETE_SECONDS", "10"))
 ADMIN_CACHE_TTL = int(os.getenv("ADMIN_CACHE_TTL", "300"))  # 5 minutes default
 
+# Allowed groups - comma-separated list of group IDs (empty = allow all)
+ALLOWED_GROUPS_STR = os.getenv("ALLOWED_GROUPS", "")
+ALLOWED_GROUPS = [int(g.strip()) for g in ALLOWED_GROUPS_STR.split(",") if g.strip()]
+
 # Data file to persist message records (use /app/data in Docker)
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "message_records.json")
@@ -111,6 +115,13 @@ async def is_admin(bot, chat_id: int, user_id: int) -> bool:
         logger.error(f"Error fetching admins: {e}")
         return False
 
+def is_allowed_group(chat_id: int) -> bool:
+    """Check if the chat is in the allowed groups list."""
+    if not ALLOWED_GROUPS:
+        return True  # If no groups specified, allow all
+    return chat_id in ALLOWED_GROUPS
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages in the topic."""
     message = update.message
@@ -124,6 +135,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Debug logging
     logger.debug(f"Message from chat: {chat_id}, thread: {message_thread_id}, user: {message.from_user.id}")
+    
+    # Only process messages from allowed groups
+    if not is_allowed_group(chat_id):
+        logger.debug(f"Ignoring message from non-allowed group: {chat_id}")
+        return
     
     # Only process messages in the specific topic
     if message_thread_id != TOPIC_ID:
@@ -181,6 +197,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot status and current records."""
     message = update.message
     
+    # Only respond in allowed groups
+    if not is_allowed_group(message.chat_id):
+        return
+    
     # Check if user is admin in the group
     if not await is_admin(context.bot, message.chat_id, message.from_user.id):
         await message.reply_text("❌ This command is for group admins only.")
@@ -209,6 +229,10 @@ async def check_duplicates_command(update: Update, context: ContextTypes.DEFAULT
     """Check for duplicate user messages today."""
     message = update.message
     
+    # Only respond in allowed groups
+    if not is_allowed_group(message.chat_id):
+        return
+    
     # Check if user is admin in the group
     if not await is_admin(context.bot, message.chat_id, message.from_user.id):
         await message.reply_text("❌ This command is for group admins only.")
@@ -230,10 +254,13 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reset a specific user's cooldown (admin only)."""
     message = update.message
     
+    # Only respond in allowed groups
+    if not is_allowed_group(message.chat_id):
+        return
+    
     # Check if user is admin in the group
     if not await is_admin(context.bot, message.chat_id, message.from_user.id):
         await message.reply_text("❌ This command is for group admins only.")
-
         return
     
     # Get user ID from command arguments
@@ -258,6 +285,10 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message."""
     message = update.message
+    
+    # Only respond in allowed groups
+    if not is_allowed_group(message.chat_id):
+        return
     
     # Check if user is admin in the group
     if not await is_admin(context.bot, message.chat_id, message.from_user.id):
@@ -304,6 +335,10 @@ def main():
     logger.info(f"Message cooldown: {MESSAGE_COOLDOWN_HOURS} hours")
     logger.info(f"Warning delete delay: {WARNING_DELETE_SECONDS} seconds")
     logger.info(f"Admin cache TTL: {ADMIN_CACHE_TTL} seconds")
+    if ALLOWED_GROUPS:
+        logger.info(f"Allowed groups: {ALLOWED_GROUPS}")
+    else:
+        logger.info("Allowed groups: ALL (no restriction)")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()

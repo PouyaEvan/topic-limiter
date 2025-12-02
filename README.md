@@ -51,6 +51,60 @@ pip install -r requirements.txt
 python bot.py
 ```
 
+### Running with Docker (docker run)
+
+Build the image locally:
+
+```bash
+docker build -t topic-limiter:latest .
+```
+
+Run the container (recommended):
+
+```bash
+# Make sure you have a `.env` with `BOT_TOKEN` in the project root
+docker run -d \
+   --name topic-limiter \
+   --restart unless-stopped \
+   --env-file .env \
+   -v "$(pwd)/message_records.json:/app/message_records.json" \
+   topic-limiter:latest
+```
+
+Notes:
+- The `--env-file .env` flag reads environment variables (including `BOT_TOKEN`) from your local `.env` file.
+- The `-v` mount persists `message_records.json` on the host so message records survive container restarts. Adjust the right-hand path (`/app/message_records.json`) if your `Dockerfile` uses a different working directory.
+- If `message_records.json` does not exist, create it first and set ownership so the container process can write to it:
+
+```bash
+touch message_records.json
+chown $(id -u):$(id -g) message_records.json
+```
+
+Alternative (pass token directly):
+
+```bash
+docker run -d --name topic-limiter \
+   --restart unless-stopped \
+   -e BOT_TOKEN=your_bot_token_here \
+   -v "$(pwd)/message_records.json:/app/message_records.json" \
+   topic-limiter:latest
+```
+
+View logs:
+
+```bash
+docker logs -f topic-limiter
+```
+
+Stop and remove container:
+
+```bash
+docker stop topic-limiter
+docker rm topic-limiter
+```
+
+
 ## Commands (Admin Only)
 
 | Command | Description |
