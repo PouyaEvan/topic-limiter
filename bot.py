@@ -30,6 +30,8 @@ ALLOWED_GROUPS_STR = os.getenv("ALLOWED_GROUPS", "")
 ALLOWED_GROUPS = [int(g.strip()) for g in ALLOWED_GROUPS_STR.split(",") if g.strip()]
 
 # Telegram's anonymous admin bot ID
+# When a user posts anonymously as the group, Telegram uses this bot ID
+# See: https://core.telegram.org/bots/api#user (is_bot field)
 GROUP_ANONYMOUS_BOT_ID = 1087968824
 
 # Data file to persist message records (use /app/data in Docker)
@@ -109,12 +111,12 @@ def save_user_cooldowns(cooldowns: dict):
     with open(USER_COOLDOWNS_FILE, 'w') as f:
         json.dump(cooldowns, f, indent=2)
 
-def clean_old_records(records, chat_id: int = None):
+def clean_old_records(records: dict, chat_id: int) -> dict:
     """Remove records older than the cooldown period. Considers custom cooldowns."""
     now = datetime.now()
     cleaned = {}
     user_cooldowns = load_user_cooldowns()
-    chat_cooldowns = user_cooldowns.get(str(chat_id), {}) if chat_id else {}
+    chat_cooldowns = user_cooldowns.get(str(chat_id), {})
     
     for user_id, timestamp_str in records.items():
         timestamp = datetime.fromisoformat(timestamp_str)
@@ -130,14 +132,14 @@ def get_user_cooldown_hours(chat_id: int, user_id: int) -> int:
     chat_cooldowns = user_cooldowns.get(str(chat_id), {})
     return chat_cooldowns.get(str(user_id), MESSAGE_COOLDOWN_HOURS)
 
-def can_user_send_message(user_id: int, records: dict, chat_id: int = None) -> tuple[bool, timedelta | None]:
+def can_user_send_message(user_id: int, records: dict, chat_id: int) -> tuple[bool, timedelta | None]:
     """Check if user can send a message. Returns (can_send, time_remaining)."""
     user_id_str = str(user_id)
     if user_id_str not in records:
         return True, None
     
     # Get custom cooldown for this user
-    cooldown_hours = get_user_cooldown_hours(chat_id, user_id) if chat_id else MESSAGE_COOLDOWN_HOURS
+    cooldown_hours = get_user_cooldown_hours(chat_id, user_id)
     
     # Green card: 0 hours cooldown means unlimited messages
     if cooldown_hours == 0:
@@ -557,7 +559,9 @@ async def setcooldown_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     try:
-        target_user_id = str(context.args[0])
+        # Validate user ID is numeric
+        target_user_id = int(context.args[0])
+        target_user_id_str = str(target_user_id)
         cooldown_hours = int(context.args[1])
         
         if cooldown_hours < 0:
@@ -570,7 +574,7 @@ async def setcooldown_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if chat_id not in user_cooldowns:
             user_cooldowns[chat_id] = {}
         
-        user_cooldowns[chat_id][target_user_id] = cooldown_hours
+        user_cooldowns[chat_id][target_user_id_str] = cooldown_hours
         save_user_cooldowns(user_cooldowns)
         
         if cooldown_hours == 0:
@@ -607,13 +611,15 @@ async def resetcooldown_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     try:
-        target_user_id = str(context.args[0])
+        # Validate user ID is numeric
+        target_user_id = int(context.args[0])
+        target_user_id_str = str(target_user_id)
         chat_id = str(message.chat_id)
         
         user_cooldowns = load_user_cooldowns()
         
-        if chat_id in user_cooldowns and target_user_id in user_cooldowns[chat_id]:
-            del user_cooldowns[chat_id][target_user_id]
+        if chat_id in user_cooldowns and target_user_id_str in user_cooldowns[chat_id]:
+            del user_cooldowns[chat_id][target_user_id_str]
             save_user_cooldowns(user_cooldowns)
             await message.reply_text(
                 f"✅ Reset cooldown for user ID `{target_user_id}` to default ({MESSAGE_COOLDOWN_HOURS} hours).",
@@ -625,6 +631,8 @@ async def resetcooldown_command(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
     
+    except ValueError:
+        await message.reply_text("❌ Invalid user ID. Please provide a numeric user ID.")
     except Exception as e:
         await message.reply_text(f"❌ Error: {e}")
 
