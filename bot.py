@@ -361,7 +361,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     records = load_records()
-    records = clean_old_records(records)
+    records = clean_old_records(records, message.chat_id)
     
     if not records:
         await message.reply_text("📊 No messages recorded in the last 24 hours.")
