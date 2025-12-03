@@ -6,8 +6,12 @@ A Telegram bot that limits users to **1 message per 24 hours** in a specific top
 
 - ✅ **Rate Limiting**: Users can only send 1 message per 24 hours in the monitored topic
 - ✅ **Auto-Delete**: Extra messages are automatically deleted
+- ✅ **Admin Exclusion**: Admins (including anonymous admins) are exempt from rate limits
+- ✅ **Custom Admin List**: Add users to a custom admin list via `/addadmin`
+- ✅ **Green Card System**: Set custom cooldown periods for specific users
+- ✅ **Anonymous Admin Detection**: Properly detects anonymous admins via sender_chat
 - ✅ **Duplicate Detection**: Check for users who might have bypassed the limit
-- ✅ **Persistent Storage**: Message records are saved to a JSON file
+- ✅ **Persistent Storage**: Message records, custom admins, and cooldowns are saved to JSON files
 - ✅ **Admin Commands**: Status, reset, and duplicate check commands
 
 ## Setup
@@ -108,32 +112,61 @@ docker rm topic-limiter
 
 ## Commands (Admin Only)
 
+### Basic Commands
+
 | Command | Description |
 |---------|-------------|
 | `/status` | View current message records (last 24h) |
 | `/check_duplicates` | Check for duplicate user messages today |
-| `/reset <user_id>` | Reset a specific user's cooldown |
+| `/reset <user_id>` | Reset a specific user's message record |
 | `/help` | Show help message |
+
+### Admin Management
+
+| Command | Description |
+|---------|-------------|
+| `/addadmin <user_id>` | Add a user to the custom admin list (exempt from limits) |
+| `/removeadmin <user_id>` | Remove a user from the custom admin list |
+| `/listadmins` | List all custom admins in this chat |
+
+### Green Card (Custom Cooldowns)
+
+| Command | Description |
+|---------|-------------|
+| `/setcooldown <user_id> <hours>` | Set a custom cooldown period for a user |
+| `/resetcooldown <user_id>` | Reset a user's cooldown to the default |
+| `/listcooldowns` | List all custom cooldowns in this chat |
+
+**Tip:** Set cooldown to `0` for unlimited messages (Green Card).
 
 ## How It Works
 
-1. When a user sends a message in the monitored topic, the bot records their user ID and timestamp
-2. If the same user tries to send another message within 24 hours:
+1. **Admin Exclusion**: Admins (including anonymous admins and custom admins) are automatically excluded from rate limits
+2. When a user sends a message in the monitored topic, the bot records their user ID and timestamp
+3. If the same user tries to send another message within their cooldown period:
    - The message is deleted
    - A temporary warning is shown (auto-deletes after 10 seconds)
-3. After 24 hours, the user can send a new message
-4. Old records are automatically cleaned up
+4. After the cooldown period, the user can send a new message
+5. Old records are automatically cleaned up
+
+### Anonymous Admin Detection
+
+The bot detects anonymous admins in two ways:
+- **sender_chat**: When an admin posts anonymously, the message's `sender_chat` matches the group ID
+- **GroupAnonymousBot**: Detects Telegram's anonymous admin bot (ID: 1087968824)
 
 ## File Structure
 
 ```
 topic-limiter/
 ├── bot.py                 # Main bot code
-├── requirements.txt       # Python dependencies
+├── pyproject.toml         # Python dependencies
 ├── .env                   # Bot token (create from .env.example)
 ├── .env.example           # Example environment file
 ├── .gitignore             # Git ignore file
 ├── message_records.json   # Persistent message records (auto-created)
+├── custom_admins.json     # Custom admin list (auto-created)
+├── user_cooldowns.json    # Custom user cooldowns (auto-created)
 └── README.md              # This file
 ```
 
