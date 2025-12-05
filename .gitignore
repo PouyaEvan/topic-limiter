@@ -1,8 +1,10 @@
 # Environment variables
 .env
 
-# Message records (persistent data)
+# Persistent data files
 message_records.json
+custom_admins.json
+user_cooldowns.json
 data/
 
 # Python

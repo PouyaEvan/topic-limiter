@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram.constants import ChatMemberStatus
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,33 +29,43 @@ ADMIN_CACHE_TTL = int(os.getenv("ADMIN_CACHE_TTL", "300"))  # 5 minutes default
 ALLOWED_GROUPS_STR = os.getenv("ALLOWED_GROUPS", "")
 ALLOWED_GROUPS = [int(g.strip()) for g in ALLOWED_GROUPS_STR.split(",") if g.strip()]
 
+# Telegram's anonymous admin bot ID
+# When a user posts anonymously as the group, Telegram uses this bot ID
+# See: https://core.telegram.org/bots/api#user (is_bot field)
+GROUP_ANONYMOUS_BOT_ID = 1087968824
+
 # Data file to persist message records (use /app/data in Docker)
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "message_records.json")
+CUSTOM_ADMINS_FILE = os.path.join(DATA_DIR, "custom_admins.json")
+USER_COOLDOWNS_FILE = os.path.join(DATA_DIR, "user_cooldowns.json")
 
-def ensure_data_file():
-    """Ensure the data file exists and is valid (not a directory)."""
-    # Create data directory if it doesn't exist
+def ensure_data_dir():
+    """Ensure the data directory exists."""
     if DATA_DIR and DATA_DIR != "." and not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
         logger.info(f"Created data directory: {DATA_DIR}")
+
+def ensure_data_file(file_path: str):
+    """Ensure the data file exists and is valid (not a directory)."""
+    ensure_data_dir()
     
-    # Check if DATA_FILE is accidentally a directory (Docker mount issue)
-    if os.path.isdir(DATA_FILE):
-        logger.warning(f"{DATA_FILE} is a directory! This can happen if Docker mounted a non-existent file.")
+    # Check if file is accidentally a directory (Docker mount issue)
+    if os.path.isdir(file_path):
+        logger.warning(f"{file_path} is a directory! This can happen if Docker mounted a non-existent file.")
         logger.warning(f"Removing directory and creating file...")
         import shutil
-        shutil.rmtree(DATA_FILE)
+        shutil.rmtree(file_path)
     
     # Create empty JSON file if it doesn't exist
-    if not os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'w') as f:
+    if not os.path.exists(file_path):
+        with open(file_path, 'w') as f:
             json.dump({}, f)
-        logger.info(f"Created data file: {DATA_FILE}")
+        logger.info(f"Created data file: {file_path}")
 
 def load_records():
     """Load message records from file."""
-    ensure_data_file()
+    ensure_data_file(DATA_FILE)
     try:
         with open(DATA_FILE, 'r') as f:
             return json.load(f)
@@ -64,33 +75,83 @@ def load_records():
 
 def save_records(records):
     """Save message records to file."""
-    ensure_data_file()
+    ensure_data_file(DATA_FILE)
     with open(DATA_FILE, 'w') as f:
         json.dump(records, f, indent=2)
 
-def clean_old_records(records):
-    """Remove records older than the cooldown period."""
+def load_custom_admins():
+    """Load custom admins from file. Returns dict keyed by chat_id."""
+    ensure_data_file(CUSTOM_ADMINS_FILE)
+    try:
+        with open(CUSTOM_ADMINS_FILE, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"Error loading custom admins: {e}. Starting with empty list.")
+        return {}
+
+def save_custom_admins(admins: dict):
+    """Save custom admins to file."""
+    ensure_data_file(CUSTOM_ADMINS_FILE)
+    with open(CUSTOM_ADMINS_FILE, 'w') as f:
+        json.dump(admins, f, indent=2)
+
+def load_user_cooldowns():
+    """Load user cooldowns from file. Returns dict keyed by chat_id, then user_id."""
+    ensure_data_file(USER_COOLDOWNS_FILE)
+    try:
+        with open(USER_COOLDOWNS_FILE, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"Error loading user cooldowns: {e}. Starting with empty list.")
+        return {}
+
+def save_user_cooldowns(cooldowns: dict):
+    """Save user cooldowns to file."""
+    ensure_data_file(USER_COOLDOWNS_FILE)
+    with open(USER_COOLDOWNS_FILE, 'w') as f:
+        json.dump(cooldowns, f, indent=2)
+
+def clean_old_records(records: dict, chat_id: int) -> dict:
+    """Remove records older than the cooldown period. Considers custom cooldowns."""
     now = datetime.now()
     cleaned = {}
+    user_cooldowns = load_user_cooldowns()
+    chat_cooldowns = user_cooldowns.get(str(chat_id), {})
+    
     for user_id, timestamp_str in records.items():
         timestamp = datetime.fromisoformat(timestamp_str)
-        if now - timestamp < timedelta(hours=MESSAGE_COOLDOWN_HOURS):
+        # Get custom cooldown for this user, or use default
+        user_cooldown_hours = chat_cooldowns.get(user_id, MESSAGE_COOLDOWN_HOURS)
+        if now - timestamp < timedelta(hours=user_cooldown_hours):
             cleaned[user_id] = timestamp_str
     return cleaned
 
-def can_user_send_message(user_id: int, records: dict) -> tuple[bool, timedelta | None]:
+def get_user_cooldown_hours(chat_id: int, user_id: int) -> int:
+    """Get the cooldown hours for a specific user (green card support)."""
+    user_cooldowns = load_user_cooldowns()
+    chat_cooldowns = user_cooldowns.get(str(chat_id), {})
+    return chat_cooldowns.get(str(user_id), MESSAGE_COOLDOWN_HOURS)
+
+def can_user_send_message(user_id: int, records: dict, chat_id: int) -> tuple[bool, timedelta | None]:
     """Check if user can send a message. Returns (can_send, time_remaining)."""
     user_id_str = str(user_id)
     if user_id_str not in records:
         return True, None
     
+    # Get custom cooldown for this user
+    cooldown_hours = get_user_cooldown_hours(chat_id, user_id)
+    
+    # Green card: 0 hours cooldown means unlimited messages
+    if cooldown_hours == 0:
+        return True, None
+    
     last_message_time = datetime.fromisoformat(records[user_id_str])
     time_since_last = datetime.now() - last_message_time
     
-    if time_since_last >= timedelta(hours=MESSAGE_COOLDOWN_HOURS):
+    if time_since_last >= timedelta(hours=cooldown_hours):
         return True, None
     
-    time_remaining = timedelta(hours=MESSAGE_COOLDOWN_HOURS) - time_since_last
+    time_remaining = timedelta(hours=cooldown_hours) - time_since_last
     return False, time_remaining
 
 def check_duplicate_users_today(records: dict) -> list[str]:
@@ -123,12 +184,38 @@ async def delete_message_later(bot, chat_id: int, message_id: int, delay: int):
     except Exception as e:
         logger.debug(f"Could not delete warning message: {e}")
 
-async def is_admin(bot, chat_id: int, user_id: int) -> bool:
-    """Check if user is an admin in the group. Uses caching to reduce API calls."""
+def is_custom_admin(chat_id: int, user_id: int) -> bool:
+    """Check if user is in the custom admin list for this chat."""
+    custom_admins = load_custom_admins()
+    chat_admins = custom_admins.get(str(chat_id), [])
+    return user_id in chat_admins
+
+async def is_admin(bot, chat_id: int, user_id: int, sender_chat=None) -> bool:
+    """Check if user is an admin in the group. 
+    
+    Supports:
+    - Regular admins via Telegram API
+    - Custom admins added via /addadmin
+    - Anonymous admins (detected via sender_chat)
+    """
+    # Check for anonymous admin (sender_chat matches the group)
+    if sender_chat and sender_chat.id == chat_id:
+        logger.debug(f"Anonymous admin detected via sender_chat (chat_id: {chat_id})")
+        return True
+    
+    # Check if this is the GroupAnonymousBot (ID: 1087968824)
+    if user_id == GROUP_ANONYMOUS_BOT_ID:
+        logger.debug(f"Anonymous admin detected via GroupAnonymousBot ID")
+        return True
+    
+    # Check custom admin list first
+    if is_custom_admin(chat_id, user_id):
+        return True
+    
+    # Check cache
     cache_key = f"{chat_id}"
     now = datetime.now()
     
-    # Check if we have a valid cache
     if cache_key in admin_cache:
         cached_data = admin_cache[cache_key]
         if (now - cached_data['timestamp']).total_seconds() < ADMIN_CACHE_TTL:
@@ -148,6 +235,15 @@ async def is_admin(bot, chat_id: int, user_id: int) -> bool:
         return user_id in admin_ids
     except Exception as e:
         logger.error(f"Error fetching admins: {e}")
+        return False
+
+async def is_group_admin_or_creator(bot, chat_id: int, user_id: int) -> bool:
+    """Check if user is a real Telegram group admin or creator (for /addadmin, /removeadmin permissions)."""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
         return False
 
 def is_allowed_group(chat_id: int) -> bool:
@@ -184,17 +280,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username or user.first_name or "Unknown"
     
-    # Skip bot messages and admins (optional - uncomment to enable)
-    # chat_member = await context.bot.get_chat_member(chat_id, user_id)
-    # if chat_member.status in ['administrator', 'creator']:
-    #     return
+    # Get sender_chat for anonymous admin detection
+    sender_chat = message.sender_chat
+    
+    # Skip admin messages (including anonymous admins and custom admins)
+    if await is_admin(context.bot, chat_id, user_id, sender_chat):
+        logger.debug(f"Skipping admin message from {username} (ID: {user_id})")
+        return
     
     # Load and clean records
     records = load_records()
-    records = clean_old_records(records)
+    records = clean_old_records(records, chat_id)
     
-    # Check if user can send a message
-    can_send, time_remaining = can_user_send_message(user_id, records)
+    # Check if user can send a message (with custom cooldown support)
+    can_send, time_remaining = can_user_send_message(user_id, records, chat_id)
     
     if not can_send:
         # Delete the message immediately
@@ -223,11 +322,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hours = int(time_remaining.total_seconds() // 3600)
             minutes = int((time_remaining.total_seconds() % 3600) // 60)
             
+            # Get user's cooldown (might be custom)
+            user_cooldown = get_user_cooldown_hours(chat_id, user_id)
+            
             # Send a warning (will be deleted after a few seconds)
             warning = await context.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=TOPIC_ID,
-                text=f"⚠️ @{username}, you can only send 1 message per {MESSAGE_COOLDOWN_HOURS} hours.\n"
+                text=f"⚠️ @{username}, you can only send 1 message per {user_cooldown} hours.\n"
                      f"Please wait {hours}h {minutes}m before sending another message.",
             )
             
@@ -259,7 +361,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     records = load_records()
-    records = clean_old_records(records)
+    records = clean_old_records(records, message.chat_id)
     
     if not records:
         await message.reply_text("📊 No messages recorded in the last 24 hours.")
@@ -334,6 +436,237 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await message.reply_text(f"❌ Error: {e}")
 
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a user to the custom admin list (real group admins only)."""
+    message = update.message
+    
+    if not is_allowed_group(message.chat_id):
+        return
+    
+    # Only real Telegram admins/creators can add custom admins
+    if not await is_group_admin_or_creator(context.bot, message.chat_id, message.from_user.id):
+        await message.reply_text("❌ Only group admins can use this command.")
+        return
+    
+    if not context.args:
+        await message.reply_text("Usage: /addadmin <user_id>\n\nReply to a user's message or provide their user ID.")
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+        chat_id = str(message.chat_id)
+        
+        custom_admins = load_custom_admins()
+        if chat_id not in custom_admins:
+            custom_admins[chat_id] = []
+        
+        if target_user_id in custom_admins[chat_id]:
+            await message.reply_text(f"ℹ️ User ID `{target_user_id}` is already a custom admin.", parse_mode="Markdown")
+            return
+        
+        custom_admins[chat_id].append(target_user_id)
+        save_custom_admins(custom_admins)
+        
+        await message.reply_text(f"✅ Added user ID `{target_user_id}` to custom admin list.", parse_mode="Markdown")
+        logger.info(f"Added custom admin {target_user_id} in chat {chat_id}")
+    
+    except ValueError:
+        await message.reply_text("❌ Invalid user ID. Please provide a numeric user ID.")
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {e}")
+
+async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a user from the custom admin list (real group admins only)."""
+    message = update.message
+    
+    if not is_allowed_group(message.chat_id):
+        return
+    
+    # Only real Telegram admins/creators can remove custom admins
+    if not await is_group_admin_or_creator(context.bot, message.chat_id, message.from_user.id):
+        await message.reply_text("❌ Only group admins can use this command.")
+        return
+    
+    if not context.args:
+        await message.reply_text("Usage: /removeadmin <user_id>")
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+        chat_id = str(message.chat_id)
+        
+        custom_admins = load_custom_admins()
+        
+        if chat_id not in custom_admins or target_user_id not in custom_admins[chat_id]:
+            await message.reply_text(f"ℹ️ User ID `{target_user_id}` is not a custom admin.", parse_mode="Markdown")
+            return
+        
+        custom_admins[chat_id].remove(target_user_id)
+        save_custom_admins(custom_admins)
+        
+        await message.reply_text(f"✅ Removed user ID `{target_user_id}` from custom admin list.", parse_mode="Markdown")
+        logger.info(f"Removed custom admin {target_user_id} from chat {chat_id}")
+    
+    except ValueError:
+        await message.reply_text("❌ Invalid user ID. Please provide a numeric user ID.")
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {e}")
+
+async def listadmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all custom admins for this chat."""
+    message = update.message
+    
+    if not is_allowed_group(message.chat_id):
+        return
+    
+    if not await is_admin(context.bot, message.chat_id, message.from_user.id):
+        await message.reply_text("❌ This command is for group admins only.")
+        return
+    
+    chat_id = str(message.chat_id)
+    custom_admins = load_custom_admins()
+    chat_admins = custom_admins.get(chat_id, [])
+    
+    if not chat_admins:
+        await message.reply_text("📋 No custom admins configured for this chat.")
+        return
+    
+    admin_list = "\n".join([f"• `{uid}`" for uid in chat_admins])
+    await message.reply_text(
+        f"📋 **Custom Admins:**\n{admin_list}\n\n**Total: {len(chat_admins)}**",
+        parse_mode="Markdown"
+    )
+
+async def setcooldown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set a custom cooldown for a specific user (green card feature)."""
+    message = update.message
+    
+    if not is_allowed_group(message.chat_id):
+        return
+    
+    if not await is_admin(context.bot, message.chat_id, message.from_user.id):
+        await message.reply_text("❌ This command is for group admins only.")
+        return
+    
+    if len(context.args) < 2:
+        await message.reply_text(
+            "Usage: /setcooldown <user_id> <hours>\n\n"
+            "Examples:\n"
+            "• `/setcooldown 123456789 12` - Set 12 hour cooldown\n"
+            "• `/setcooldown 123456789 0` - No cooldown (unlimited messages)",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        # Validate user ID is numeric
+        target_user_id = int(context.args[0])
+        target_user_id_str = str(target_user_id)
+        cooldown_hours = int(context.args[1])
+        
+        if cooldown_hours < 0:
+            await message.reply_text("❌ Cooldown hours must be 0 or greater.")
+            return
+        
+        chat_id = str(message.chat_id)
+        user_cooldowns = load_user_cooldowns()
+        
+        if chat_id not in user_cooldowns:
+            user_cooldowns[chat_id] = {}
+        
+        user_cooldowns[chat_id][target_user_id_str] = cooldown_hours
+        save_user_cooldowns(user_cooldowns)
+        
+        if cooldown_hours == 0:
+            await message.reply_text(
+                f"🎫 **Green Card Granted!**\nUser ID `{target_user_id}` can now send unlimited messages.",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.reply_text(
+                f"✅ Set cooldown for user ID `{target_user_id}` to **{cooldown_hours} hours**.",
+                parse_mode="Markdown"
+            )
+        
+        logger.info(f"Set cooldown for user {target_user_id} to {cooldown_hours}h in chat {chat_id}")
+    
+    except ValueError:
+        await message.reply_text("❌ Invalid arguments. User ID and hours must be numbers.")
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {e}")
+
+async def resetcooldown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset a user's cooldown to the default value."""
+    message = update.message
+    
+    if not is_allowed_group(message.chat_id):
+        return
+    
+    if not await is_admin(context.bot, message.chat_id, message.from_user.id):
+        await message.reply_text("❌ This command is for group admins only.")
+        return
+    
+    if not context.args:
+        await message.reply_text("Usage: /resetcooldown <user_id>")
+        return
+    
+    try:
+        # Validate user ID is numeric
+        target_user_id = int(context.args[0])
+        target_user_id_str = str(target_user_id)
+        chat_id = str(message.chat_id)
+        
+        user_cooldowns = load_user_cooldowns()
+        
+        if chat_id in user_cooldowns and target_user_id_str in user_cooldowns[chat_id]:
+            del user_cooldowns[chat_id][target_user_id_str]
+            save_user_cooldowns(user_cooldowns)
+            await message.reply_text(
+                f"✅ Reset cooldown for user ID `{target_user_id}` to default ({MESSAGE_COOLDOWN_HOURS} hours).",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.reply_text(
+                f"ℹ️ User ID `{target_user_id}` already has default cooldown.",
+                parse_mode="Markdown"
+            )
+    
+    except ValueError:
+        await message.reply_text("❌ Invalid user ID. Please provide a numeric user ID.")
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {e}")
+
+async def listcooldowns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all custom cooldowns for this chat."""
+    message = update.message
+    
+    if not is_allowed_group(message.chat_id):
+        return
+    
+    if not await is_admin(context.bot, message.chat_id, message.from_user.id):
+        await message.reply_text("❌ This command is for group admins only.")
+        return
+    
+    chat_id = str(message.chat_id)
+    user_cooldowns = load_user_cooldowns()
+    chat_cooldowns = user_cooldowns.get(chat_id, {})
+    
+    if not chat_cooldowns:
+        await message.reply_text(f"📋 No custom cooldowns configured. Default: {MESSAGE_COOLDOWN_HOURS} hours.")
+        return
+    
+    cooldown_list = []
+    for uid, hours in chat_cooldowns.items():
+        if hours == 0:
+            cooldown_list.append(f"• `{uid}`: 🎫 Green Card (unlimited)")
+        else:
+            cooldown_list.append(f"• `{uid}`: {hours} hours")
+    
+    await message.reply_text(
+        f"📋 **Custom Cooldowns:**\n" + "\n".join(cooldown_list) + f"\n\n**Default: {MESSAGE_COOLDOWN_HOURS} hours**",
+        parse_mode="Markdown"
+    )
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message."""
     message = update.message
@@ -355,13 +688,26 @@ This bot limits users to 1 message per {MESSAGE_COOLDOWN_HOURS} hours in the mon
 **Commands (Admin Only):**
 • `/status` - View current message records
 • `/check_duplicates` - Check for duplicate users today
-• `/reset <user_id>` - Reset a user's cooldown
+• `/reset <user_id>` - Reset a user's message record
 • `/help` - Show this message
 
+**Admin Management:**
+• `/addadmin <user_id>` - Add a custom admin (exempt from limits)
+• `/removeadmin <user_id>` - Remove a custom admin
+• `/listadmins` - List all custom admins
+
+**Green Card (Custom Cooldowns):**
+• `/setcooldown <user_id> <hours>` - Set custom cooldown
+• `/resetcooldown <user_id>` - Reset to default cooldown
+• `/listcooldowns` - List all custom cooldowns
+
+_Tip: Set cooldown to 0 for unlimited messages (Green Card)._
+
 **How it works:**
-1. Users can send only 1 message per {MESSAGE_COOLDOWN_HOURS} hours in the topic
-2. Additional messages are automatically deleted
-3. A temporary warning is shown to the user
+1. Admins (including anonymous admins) are exempt from limits
+2. Users can send only 1 message per {MESSAGE_COOLDOWN_HOURS} hours in the topic
+3. Additional messages are automatically deleted
+4. A temporary warning is shown to the user
 
 **Current Config:**
 • Topic ID: `{TOPIC_ID}`
@@ -399,6 +745,12 @@ def main():
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("check_duplicates", check_duplicates_command))
     application.add_handler(CommandHandler("reset", reset_command))
+    application.add_handler(CommandHandler("addadmin", addadmin_command))
+    application.add_handler(CommandHandler("removeadmin", removeadmin_command))
+    application.add_handler(CommandHandler("listadmins", listadmins_command))
+    application.add_handler(CommandHandler("setcooldown", setcooldown_command))
+    application.add_handler(CommandHandler("resetcooldown", resetcooldown_command))
+    application.add_handler(CommandHandler("listcooldowns", listcooldowns_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     
